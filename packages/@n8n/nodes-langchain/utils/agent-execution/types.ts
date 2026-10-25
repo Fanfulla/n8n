@@ -104,6 +104,12 @@ export type ContentBlock =
 export type GoogleThinkingMetadata = {
 	/** Thought signature for Gemini extended thinking */
 	thoughtSignature?: string;
+	/**
+	 * Visible text from the same model turn as the tool call.
+	 * The agent replays this text with the tool call.
+	 * The field is absent when the model sent no text.
+	 */
+	modelText?: string;
 };
 
 /**

@@ -17,6 +17,8 @@ import type {
 interface ProviderMetadata {
 	/** Gemini thought_signature for extended thinking */
 	thoughtSignature?: string;
+	/** Visible text the model wrote in the same turn as the tool call */
+	modelText?: string;
 	/** Anthropic thinking content */
 	thinkingContent?: string;
 	/** Anthropic thinking type (thinking or redacted_thinking) */
@@ -41,6 +43,11 @@ function extractProviderMetadata(metadata?: RequestResponseMetadata): ProviderMe
 	const thoughtSignature =
 		typeof metadata.google?.thoughtSignature === 'string'
 			? metadata.google.thoughtSignature
+			: undefined;
+
+	const modelText =
+		typeof metadata.google?.modelText === 'string' && metadata.google.modelText.length > 0
+			? metadata.google.modelText
 			: undefined;
 
 	// Extract Anthropic metadata
@@ -68,6 +75,7 @@ function extractProviderMetadata(metadata?: RequestResponseMetadata): ProviderMe
 
 	return {
 		thoughtSignature,
+		modelText,
 		thinkingContent,
 		thinkingType,
 		thinkingSignature,
@@ -229,7 +237,8 @@ function buildGeminiAdditionalKwargs(
  *
  * For Anthropic thinking mode, content is an array of blocks (thinking + tool_use).
  * For Gemini with thought signatures, additional_kwargs carries the signature.
- * For other providers, content is a simple string with tool_calls set.
+ * Gemini content is the model's own text, or empty when the model sent none.
+ * For other providers, content is empty and tool_calls is set.
  */
 function buildIndividualAIMessage(
 	toolId: string,
@@ -244,14 +253,21 @@ function buildIndividualAIMessage(
 		type: 'tool_call' as const,
 	};
 
-	const content = buildMessageContent(providerMetadata, toolInput, toolId, toolName);
+	const anthropicContent = buildMessageContent(providerMetadata, toolInput, toolId, toolName);
+	// Only a Gemini turn with a signature replays model text. Other providers keep empty content.
+	const geminiText =
+		anthropicContent === null && providerMetadata.thoughtSignature
+			? providerMetadata.modelText
+			: undefined;
+	const hasGeminiText = typeof geminiText === 'string' && geminiText.length > 0;
 
 	const additionalKwargs: Record<string, unknown> = providerMetadata.thoughtSignature
 		? buildGeminiAdditionalKwargs(
 				[{ id: toolId, name: toolName, args: toolInput }],
 				providerMetadata.thoughtSignature,
-				// Empty content produces no text part, so the function call is the first part
-				content !== null && content.length > 0,
+				// A text part occupies the first Gemini request slot. The signature must stay
+				// on the function call, so the signatures array grows only when that part exists.
+				(anthropicContent !== null && anthropicContent.length > 0) || hasGeminiText,
 			)
 		: {};
 	// DeepSeek's thinking mode requires reasoning_content to be echoed back on the
@@ -260,10 +276,17 @@ function buildIndividualAIMessage(
 		additionalKwargs.reasoning_content = providerMetadata.reasoningContent;
 	}
 
+	if (anthropicContent !== null) {
+		return new AIMessage({
+			content: anthropicContent,
+			// When content is an array (Anthropic thinking), LangChain ignores tool_calls
+			...(Object.keys(additionalKwargs).length > 0 && { additional_kwargs: additionalKwargs }),
+		});
+	}
+
 	return new AIMessage({
-		content: content ?? [],
-		// When content is an array (Anthropic thinking), LangChain ignores tool_calls
-		...(content === null && { tool_calls: [toolCall] }),
+		content: hasGeminiText ? geminiText : [],
+		tool_calls: [toolCall],
 		...(Object.keys(additionalKwargs).length > 0 && { additional_kwargs: additionalKwargs }),
 	});
 }
@@ -294,13 +317,16 @@ function buildSharedGeminiAIMessage(
 		type: 'tool_call' as const,
 	}));
 
-	const toolNames = processedTools.map((pt) => pt.nodeName).join(', ');
+	// Chat memory and the next model request store this content.
+	// Replay the model's text, or leave it empty, so a placeholder cannot enter a later reply.
+	const textSource = processedTools.find((tool) => tool.providerMetadata.modelText);
+	const modelText = textSource?.providerMetadata.modelText;
+	const hasModelText = typeof modelText === 'string' && modelText.length > 0;
 
 	return new AIMessage({
-		content: `Calling tools: ${toolNames}`,
+		content: hasModelText ? modelText : [],
 		tool_calls: allToolCalls,
-		// String content serializes to a text part preceding the function-call parts
-		additional_kwargs: buildGeminiAdditionalKwargs(allToolCalls, thoughtSignature, true),
+		additional_kwargs: buildGeminiAdditionalKwargs(allToolCalls, thoughtSignature, hasModelText),
 	});
 }
 

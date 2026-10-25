@@ -1825,9 +1825,13 @@ describe('buildSteps', () => {
 				.__gemini_function_call_thought_signatures__ as Record<string, string>;
 			expect(sigMap).toEqual({ call_1: 'shared_gemini_sig' });
 
-			// Signatures array should have: ['', 'sig', ''] (text part, first func call, second func call)
+			// No model text was stored, so there is no leading text part. The signature stays
+			// on the first function call. A synthetic "Calling tools" string must not fill the gap.
+			expect(firstMessage.content).toEqual([]);
+			expect(JSON.stringify(firstMessage.content)).not.toContain('Calling tools');
 			const sigArray = firstMessage.additional_kwargs.signatures as string[];
-			expect(sigArray).toEqual(['', 'shared_gemini_sig', '']);
+			expect(sigArray).toEqual(['shared_gemini_sig', '']);
+			expect(result[0].action.log).toBe('Calling Calculator');
 
 			// Second step should have EMPTY messageLog (no duplicate AIMessage)
 			expect(result[1].action.messageLog).toEqual([]);
@@ -1938,6 +1942,155 @@ describe('buildSteps', () => {
 			expect(
 				message.additional_kwargs?.__gemini_function_call_thought_signatures__,
 			).toBeUndefined();
+		});
+	});
+
+	describe('Gemini model text replay', () => {
+		const toolResponse = (
+			nodeName: string,
+			id: string,
+			input: IDataObject,
+			result: IDataObject,
+			google?: RequestResponseMetadata['google'],
+		): NonNullable<EngineResponse<RequestResponseMetadata>['actionResponses']>[number] => ({
+			action: {
+				actionType: 'ExecutionNodeAction',
+				nodeName,
+				input,
+				type: NodeConnectionTypes.AiTool,
+				id,
+				metadata: {
+					itemIndex: 0,
+					...(google && { google }),
+				},
+			},
+			data: {
+				data: {
+					ai_tool: [[{ json: result }]],
+				},
+				executionTime: 0,
+				startTime: 0,
+				executionIndex: 0,
+				source: [],
+			},
+		});
+
+		it('replays the model text on a single Gemini tool call and keeps the signature', () => {
+			const response: EngineResponse<RequestResponseMetadata> = {
+				actionResponses: [
+					toolResponse(
+						'Calculator',
+						'call_123',
+						{ expression: '2+2' },
+						{ result: '4' },
+						{
+							thoughtSignature: 'gemini_thought_sig_abc123',
+							modelText: 'I will calculate that.',
+						},
+					),
+				],
+				metadata: {},
+			};
+
+			const result = buildSteps(response, itemIndex);
+			const message = result[0].action.messageLog![0];
+
+			expect(message.content).toBe('I will calculate that.');
+			expect(message.content).not.toContain('Calling tools');
+			expect(message.tool_calls?.[0]).toMatchObject({
+				id: 'call_123',
+				name: 'Calculator',
+				args: { expression: '2+2' },
+			});
+			expect(message.additional_kwargs.__gemini_function_call_thought_signatures__).toEqual({
+				call_123: 'gemini_thought_sig_abc123',
+			});
+			// The text is one request part. The signature stays on the function call after it.
+			expect(message.additional_kwargs.signatures).toEqual(['', 'gemini_thought_sig_abc123']);
+		});
+
+		it('replays the model text once for parallel Gemini tool calls', () => {
+			const modelText = 'I am going to convert both words.';
+			const google = { thoughtSignature: 'shared_gemini_sig', modelText };
+			const response: EngineResponse<RequestResponseMetadata> = {
+				actionResponses: [
+					toolResponse('code_tool', 'call_1', { input: 'alpha' }, { result: 'ALPHA' }, google),
+					toolResponse('reverse_tool', 'call_2', { input: 'beta' }, { result: 'ateb' }, google),
+				],
+				metadata: {},
+			};
+
+			const result = buildSteps(response, itemIndex);
+
+			expect(result).toHaveLength(2);
+			const message = result[0].action.messageLog![0];
+			expect(message.content).toBe(modelText);
+			expect(JSON.stringify(message)).not.toContain('Calling tools');
+			expect(message.tool_calls?.map((call) => call.name)).toEqual(['code_tool', 'reverse_tool']);
+			expect(message.tool_calls?.map((call) => call.args)).toEqual([
+				{ input: 'alpha' },
+				{ input: 'beta' },
+			]);
+			expect(message.additional_kwargs.__gemini_function_call_thought_signatures__).toEqual({
+				call_1: 'shared_gemini_sig',
+			});
+			expect(message.additional_kwargs.signatures).toEqual(['', 'shared_gemini_sig', '']);
+			expect(result[1].action.messageLog).toEqual([]);
+			expect(result[0].action.log).toBe(modelText);
+		});
+
+		it('replays three parallel Gemini tool calls with one signature and no synthetic text', () => {
+			const modelText = 'I will call three tools.';
+			const google = { thoughtSignature: 'shared_sig', modelText };
+			const response: EngineResponse<RequestResponseMetadata> = {
+				actionResponses: [
+					toolResponse('tool_a', 'call_a', { input: 'a' }, { result: 'A' }, google),
+					toolResponse('tool_b', 'call_b', { input: 'b' }, { result: 'B' }, google),
+					toolResponse('tool_c', 'call_c', { input: 'c' }, { result: 'C' }, google),
+				],
+				metadata: {},
+			};
+
+			const result = buildSteps(response, itemIndex);
+			const message = result[0].action.messageLog![0];
+
+			expect(result).toHaveLength(3);
+			expect(message.content).toBe(modelText);
+			expect(message.tool_calls?.map((call) => call.id)).toEqual(['call_a', 'call_b', 'call_c']);
+			expect(message.additional_kwargs.signatures).toEqual(['', 'shared_sig', '', '']);
+			expect(message.additional_kwargs.__gemini_function_call_thought_signatures__).toEqual({
+				call_a: 'shared_sig',
+			});
+			expect(result[1].action.messageLog).toEqual([]);
+			expect(result[2].action.messageLog).toEqual([]);
+			expect(JSON.stringify(result)).not.toContain('Calling tools');
+		});
+
+		it('does not replay model text on a turn that has no Gemini signature', () => {
+			const response: EngineResponse<RequestResponseMetadata> = {
+				actionResponses: [
+					toolResponse(
+						'Calculator',
+						'call_123',
+						{ expression: '2+2' },
+						{ result: '4' },
+						{
+							modelText: 'I will calculate that.',
+						},
+					),
+				],
+				metadata: {},
+			};
+
+			const result = buildSteps(response, itemIndex);
+			const message = result[0].action.messageLog![0];
+
+			expect(message.content).toEqual([]);
+			expect(message.tool_calls).toHaveLength(1);
+			expect(
+				message.additional_kwargs?.__gemini_function_call_thought_signatures__,
+			).toBeUndefined();
+			expect(result[0].action.log).toBe('Calling Calculator');
 		});
 	});
 
