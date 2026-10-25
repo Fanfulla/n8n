@@ -4,6 +4,7 @@ import omit from 'lodash/omit';
 import type { EngineRequest, IDataObject } from 'n8n-workflow';
 import { NodeConnectionTypes } from 'n8n-workflow';
 
+import { readGeminiReplay } from './geminiThoughtSignature';
 import type {
 	HitlMetadata,
 	RequestResponseMetadata,
@@ -54,29 +55,15 @@ function extractThinkingMetadata(
 	const effectiveMessageLog =
 		toolCall.messageLog && toolCall.messageLog.length > 0 ? toolCall.messageLog : sharedMessageLog;
 
-	// Extract thought signatures from additionalKwargs (Gemini)
-	let thoughtSignature: string | undefined;
-	if (effectiveAdditionalKwargs) {
-		// Check for signature mapped by tool call ID
-		const geminiSignatures = effectiveAdditionalKwargs[
-			'__gemini_function_call_thought_signatures__'
-		] as Record<string, string> | undefined;
-		if (geminiSignatures && typeof geminiSignatures === 'object') {
-			// Get signature for this specific tool call, or ANY signature if ID not found
-			// (for parallel calls, signature may be keyed to first call's ID)
-			thoughtSignature =
-				geminiSignatures[toolCall.toolCallId] || Object.values(geminiSignatures)[0];
-		}
-
-		// Also check signatures array format (LangChain Google uses this)
-		if (!thoughtSignature) {
-			const signatures = effectiveAdditionalKwargs.signatures as string[] | undefined;
-			if (signatures && Array.isArray(signatures) && signatures.length > 0) {
-				// First non-empty signature (parallel calls have signature only on first)
-				thoughtSignature = signatures.find((s) => s && s.length > 0);
-			}
-		}
-	}
+	// Keep the signature array and the content parts. A later turn has to send
+	// each value back on the same part. The first non-empty value can belong
+	// to a thought part, so it is not the function-call signature.
+	const geminiReplay = readGeminiReplay({
+		toolCallId: toolCall.toolCallId,
+		additionalKwargs: effectiveAdditionalKwargs,
+		messages: effectiveMessageLog,
+	});
+	let thoughtSignature = geminiReplay.thoughtSignature;
 
 	// Extract DeepSeek reasoning_content (must be echoed back on tool-calling turns)
 	let reasoningContent: string | undefined;
@@ -117,49 +104,6 @@ function extractThinkingMetadata(
 					}
 				}
 
-				// Also check additional_kwargs on the message for Gemini thought signatures
-				if (!thoughtSignature && 'additional_kwargs' in message) {
-					const msgAdditionalKwargs = message.additional_kwargs as
-						| Record<string, unknown>
-						| undefined;
-					if (msgAdditionalKwargs) {
-						// First check the map format: __gemini_function_call_thought_signatures__
-						const geminiSignatures = msgAdditionalKwargs[
-							'__gemini_function_call_thought_signatures__'
-						] as Record<string, string> | undefined;
-						if (geminiSignatures && typeof geminiSignatures === 'object') {
-							// Get signature for this tool call, or ANY signature for parallel calls
-							thoughtSignature =
-								geminiSignatures[toolCall.toolCallId] || Object.values(geminiSignatures)[0];
-						}
-
-						// If not found, check the signatures array format
-						// LangChain Google returns signatures as an array that corresponds to tool_calls array
-						if (!thoughtSignature) {
-							const signatures = msgAdditionalKwargs.signatures as string[] | undefined;
-							// Get tool_calls from message (not from additional_kwargs)
-							const msgToolCalls =
-								'tool_calls' in message
-									? (message.tool_calls as Array<{ id?: string }> | undefined)
-									: undefined;
-
-							if (signatures && Array.isArray(signatures)) {
-								if (msgToolCalls && Array.isArray(msgToolCalls)) {
-									// Find the index of this tool call by ID
-									const toolCallIndex = msgToolCalls.findIndex(
-										(tc) => tc.id === toolCall.toolCallId,
-									);
-									if (toolCallIndex > 0 && toolCallIndex < signatures.length) {
-										thoughtSignature = signatures[toolCallIndex];
-									}
-								}
-								// Fallback: get first non-empty signature
-								thoughtSignature ??= signatures.find((s) => s && s.length > 0);
-							}
-						}
-					}
-				}
-
 				// DeepSeek reasoning_content (fallback for the non-streaming path, where
 				// ToolCallRequest.additionalKwargs isn't populated from the raw AIMessage).
 				// Independent of the thoughtSignature gate above - must run regardless of
@@ -178,8 +122,14 @@ function extractThinkingMetadata(
 	}
 
 	// Build result object
-	if (thoughtSignature) {
-		result.google = { thoughtSignature };
+	if (thoughtSignature || geminiReplay.signatures) {
+		result.google = {
+			...(thoughtSignature ? { thoughtSignature } : {}),
+			...(geminiReplay.signatures ? { signatures: geminiReplay.signatures } : {}),
+			...(geminiReplay.signatures && geminiReplay.content !== undefined
+				? { content: geminiReplay.content }
+				: {}),
+		};
 	}
 
 	// Empty thinking text is valid because the signature carries the reasoning.

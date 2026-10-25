@@ -1032,6 +1032,45 @@ describe('createEngineRequests', () => {
 			expect(result[1].metadata.google?.thoughtSignature).toBe('shared_signature');
 		});
 
+		it('should share the function-call signature when a leading part also has one', async () => {
+			const tools = [
+				createMockTool('calculator', { sourceNodeName: 'Calculator' }),
+				createMockTool('weather', { sourceNodeName: 'Weather' }),
+			];
+
+			const toolCalls: ToolCallRequest[] = [
+				{
+					tool: 'calculator',
+					toolInput: { expression: '2+2' },
+					toolCallId: 'call_1',
+					messageLog: [
+						{
+							content: [{ type: 'reasoning', reasoning: 'Call both tools.' }],
+							tool_calls: [
+								{ id: 'call_1', name: 'calculator', args: { expression: '2+2' } },
+								{ id: 'call_2', name: 'weather', args: { location: 'NYC' } },
+							],
+							additional_kwargs: {
+								signatures: ['thought_signature', 'function_call_signature', ''],
+							},
+						},
+					],
+				},
+				{
+					tool: 'weather',
+					toolInput: { location: 'NYC' },
+					toolCallId: 'call_2',
+					messageLog: [],
+				},
+			];
+
+			const result = createEngineRequests(toolCalls, 0, tools);
+
+			expect(result).toHaveLength(2);
+			expect(result[0].metadata.google?.thoughtSignature).toBe('function_call_signature');
+			expect(result[1].metadata.google?.thoughtSignature).toBe('function_call_signature');
+		});
+
 		it('should share additionalKwargs from first tool call to subsequent calls', async () => {
 			const tools = [
 				createMockTool('calculator', { sourceNodeName: 'Calculator' }),
@@ -1064,7 +1103,42 @@ describe('createEngineRequests', () => {
 			expect(result[1].metadata.google?.thoughtSignature).toBe('shared_sig_from_kwargs');
 		});
 
-		it('should extract signature from signatures array format', async () => {
+		it('should keep the function-call signature when a leading part also has one', async () => {
+			const tools = [createMockTool('calculator', { sourceNodeName: 'Calculator' })];
+
+			// Gemini 3 puts a signature on the thought part and another on the function call.
+			// The function call is the part the next request must send back.
+			const toolCalls: ToolCallRequest[] = [
+				{
+					tool: 'calculator',
+					toolInput: { expression: '2+2' },
+					toolCallId: 'call_1',
+					messageLog: [
+						{
+							content: [{ type: 'reasoning', reasoning: 'Need the calculator.' }],
+							tool_calls: [{ id: 'call_1', name: 'calculator', args: { expression: '2+2' } }],
+							additional_kwargs: {
+								signatures: ['thought_signature', 'function_call_signature'],
+							},
+						},
+					],
+				},
+			];
+
+			const result = createEngineRequests(toolCalls, 0, tools);
+
+			expect(result).toHaveLength(1);
+			expect(result[0].metadata.google?.thoughtSignature).toBe('function_call_signature');
+			expect(result[0].metadata.google?.signatures).toEqual([
+				'thought_signature',
+				'function_call_signature',
+			]);
+			expect(result[0].metadata.google?.content).toEqual([
+				{ type: 'reasoning', reasoning: 'Need the calculator.' },
+			]);
+		});
+
+		it('should keep a single function-call signature', async () => {
 			const tools = [createMockTool('calculator', { sourceNodeName: 'Calculator' })];
 
 			const toolCalls: ToolCallRequest[] = [
@@ -1073,7 +1147,7 @@ describe('createEngineRequests', () => {
 					toolInput: { expression: '2+2' },
 					toolCallId: 'call_1',
 					additionalKwargs: {
-						signatures: ['first_signature', 'second_signature'],
+						signatures: ['function_call_signature'],
 					},
 				},
 			];
@@ -1081,8 +1155,34 @@ describe('createEngineRequests', () => {
 			const result = createEngineRequests(toolCalls, 0, tools);
 
 			expect(result).toHaveLength(1);
-			// Should get the first non-empty signature
-			expect(result[0].metadata.google?.thoughtSignature).toBe('first_signature');
+			expect(result[0].metadata.google?.thoughtSignature).toBe('function_call_signature');
+			expect(result[0].metadata.google?.signatures).toEqual(['function_call_signature']);
+		});
+
+		it('should recover a function-call signature when streaming appends an empty slot', async () => {
+			const tools = [createMockTool('calculator', { sourceNodeName: 'Calculator' })];
+
+			const toolCalls: ToolCallRequest[] = [
+				{
+					tool: 'calculator',
+					toolInput: { expression: '2+2' },
+					toolCallId: 'call_1',
+					messageLog: [
+						{
+							content: '',
+							tool_calls: [{ id: 'call_1', name: 'calculator', args: { expression: '2+2' } }],
+							additional_kwargs: {
+								signatures: ['function_call_signature', ''],
+							},
+						},
+					],
+				},
+			];
+
+			const result = createEngineRequests(toolCalls, 0, tools);
+
+			expect(result).toHaveLength(1);
+			expect(result[0].metadata.google?.thoughtSignature).toBe('function_call_signature');
 		});
 
 		it('should skip empty strings when finding signature in array', async () => {

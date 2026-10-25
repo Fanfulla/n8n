@@ -1698,6 +1698,148 @@ describe('buildSteps', () => {
 		});
 	});
 
+	describe('Gemini thought_signature across tool rounds', () => {
+		const toolResponse = (
+			nodeName: string,
+			id: string,
+			input: IDataObject,
+			google: NonNullable<RequestResponseMetadata['google']>,
+			result: IDataObject,
+		): NonNullable<EngineResponse<RequestResponseMetadata>['actionResponses']>[number] => ({
+			action: {
+				actionType: 'ExecutionNodeAction',
+				nodeName,
+				input,
+				type: NodeConnectionTypes.AiTool,
+				id,
+				metadata: { itemIndex: 0, google },
+			},
+			data: {
+				data: { ai_tool: [[{ json: result }]] },
+				executionTime: 0,
+				startTime: 0,
+				executionIndex: 0,
+				source: [],
+			},
+		});
+
+		it('should replay one function call with its signature', () => {
+			const result = buildSteps(
+				{
+					actionResponses: [
+						toolResponse(
+							'Calculator',
+							'call_1',
+							{ expression: '2+2' },
+							{ thoughtSignature: 'sig_a', signatures: ['sig_a'] },
+							{ result: '4' },
+						),
+					],
+					metadata: {},
+				},
+				itemIndex,
+			);
+
+			expect(result).toHaveLength(1);
+			const message = result[0].action.messageLog![0];
+			expect(message.content).toEqual([]);
+			expect(message.tool_calls).toHaveLength(1);
+			expect(message.additional_kwargs.signatures).toEqual(['sig_a']);
+		});
+
+		it('should keep each function-call signature across sequential rounds', () => {
+			const firstRound = buildSteps(
+				{
+					actionResponses: [
+						toolResponse(
+							'Calculator',
+							'call_1',
+							{ expression: '2+2' },
+							{ thoughtSignature: 'sig_a', signatures: ['sig_a'] },
+							{ result: '4' },
+						),
+					],
+					metadata: {},
+				},
+				itemIndex,
+			);
+
+			const secondRound = buildSteps(
+				{
+					actionResponses: [
+						toolResponse(
+							'Book',
+							'call_2',
+							{ time: '10 AM' },
+							{
+								thoughtSignature: 'sig_b',
+								signatures: ['thought_b', 'sig_b'],
+								content: [{ type: 'reasoning', reasoning: 'The first result is 4.' }],
+							},
+							{ status: 'booked' },
+						),
+					],
+					metadata: { previousRequests: firstRound },
+				},
+				itemIndex,
+			);
+
+			expect(secondRound).toHaveLength(2);
+			const firstMessage = secondRound[0].action.messageLog![0];
+			const secondMessage = secondRound[1].action.messageLog![0];
+			expect(firstMessage.additional_kwargs.signatures).toEqual(['sig_a']);
+			expect(firstMessage.tool_calls?.map((call) => call.name)).toEqual(['Calculator']);
+			// The thought part keeps its signature. The function call keeps sig_b.
+			expect(secondMessage.content).toEqual([
+				{ type: 'reasoning', reasoning: 'The first result is 4.' },
+			]);
+			expect(secondMessage.additional_kwargs.signatures).toEqual(['thought_b', 'sig_b']);
+			expect(secondMessage.tool_calls).toHaveLength(1);
+			expect(secondMessage.tool_calls?.[0]?.name).toBe('Book');
+		});
+
+		it('should replay parallel function calls with the signature on the first call', () => {
+			const result = buildSteps(
+				{
+					actionResponses: [
+						toolResponse(
+							'Calculator',
+							'call_1',
+							{ expression: '2+2' },
+							{
+								thoughtSignature: 'shared_sig',
+								signatures: ['thought_sig', 'shared_sig', ''],
+								content: [{ type: 'reasoning', reasoning: 'Call both.' }],
+							},
+							{ result: '4' },
+						),
+						toolResponse(
+							'Weather',
+							'call_2',
+							{ location: 'NYC' },
+							{
+								thoughtSignature: 'shared_sig',
+								signatures: ['thought_sig', 'shared_sig', ''],
+								content: [{ type: 'reasoning', reasoning: 'Call both.' }],
+							},
+							{ temp: '72F' },
+						),
+					],
+					metadata: {},
+				},
+				itemIndex,
+			);
+
+			expect(result).toHaveLength(2);
+			const sharedMessage = result[0].action.messageLog![0];
+			expect(sharedMessage.content).toEqual([{ type: 'reasoning', reasoning: 'Call both.' }]);
+			expect(sharedMessage.tool_calls).toHaveLength(2);
+			// The thought part keeps its signature. Only the first function call carries shared_sig.
+			expect(sharedMessage.additional_kwargs.signatures).toEqual(['thought_sig', 'shared_sig', '']);
+			expect(result[1].action.messageLog).toEqual([]);
+		});
+	});
+
 	describe('Gemini thought_signature in additional_kwargs', () => {
 		it('should include thought_signature in AIMessage additional_kwargs', () => {
 			const response: EngineResponse<RequestResponseMetadata> = {

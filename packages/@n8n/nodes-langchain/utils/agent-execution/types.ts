@@ -99,11 +99,32 @@ export type ContentBlock =
 	| GeminiThoughtSignatureBlock;
 
 /**
+ * One model content part that lines up with a leading Gemini signature.
+ * The index signature matches LangChain content blocks.
+ */
+export type GeminiContentBlock = {
+	type: string;
+	[key: string]: unknown;
+};
+
+/**
+ * Model content that lines up with the start of a Gemini signature array.
+ * Gemini applies the array only when its length matches the part count.
+ */
+export type GeminiReplayContent = string | GeminiContentBlock[];
+
+/**
  * Google/Gemini-specific thinking metadata.
+ * A turn can carry a signature on a thought part and another on a function call.
+ * Both have to come back on the same parts.
  */
 export type GoogleThinkingMetadata = {
-	/** Thought signature for Gemini extended thinking */
+	/** Signature on the first function call in this turn. */
 	thoughtSignature?: string;
+	/** Signature for each part, in order. Content parts come before function calls. */
+	signatures?: string[];
+	/** Content parts that occupy the leading signature slots. */
+	content?: GeminiReplayContent;
 };
 
 /**

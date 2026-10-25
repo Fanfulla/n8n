@@ -3,12 +3,14 @@ import omit from 'lodash/omit';
 import { nodeNameToToolName } from 'n8n-workflow';
 import type { EngineResponse, EngineResult, IDataObject } from 'n8n-workflow';
 
+import { geminiReplayForToolCount } from './geminiThoughtSignature';
 import type {
 	RequestResponseMetadata,
 	ToolCallData,
 	ThinkingContentBlock,
 	RedactedThinkingContentBlock,
 	ToolUseContentBlock,
+	GeminiReplayContent,
 } from './types';
 
 /**
@@ -17,6 +19,10 @@ import type {
 interface ProviderMetadata {
 	/** Gemini thought_signature for extended thinking */
 	thoughtSignature?: string;
+	/** Signature for each Gemini part in this turn */
+	signatures?: string[];
+	/** Content parts that occupy the leading Gemini signature slots */
+	content?: GeminiReplayContent;
 	/** Anthropic thinking content */
 	thinkingContent?: string;
 	/** Anthropic thinking type (thinking or redacted_thinking) */
@@ -43,6 +49,16 @@ function extractProviderMetadata(metadata?: RequestResponseMetadata): ProviderMe
 			? metadata.google.thoughtSignature
 			: undefined;
 
+	const signatures =
+		Array.isArray(metadata.google?.signatures) &&
+		metadata.google.signatures.length > 0 &&
+		metadata.google.signatures.every((signature) => typeof signature === 'string')
+			? metadata.google.signatures
+			: undefined;
+
+	// Checked against the tool-call count when the message is built.
+	const content = metadata.google?.content;
+
 	// Extract Anthropic metadata
 	const thinkingContent =
 		typeof metadata.anthropic?.thinkingContent === 'string'
@@ -68,6 +84,8 @@ function extractProviderMetadata(metadata?: RequestResponseMetadata): ProviderMe
 
 	return {
 		thoughtSignature,
+		signatures,
+		content,
 		thinkingContent,
 		thinkingType,
 		thinkingSignature,
@@ -199,14 +217,16 @@ interface ProcessedToolResponse {
  * @param thoughtSignature - The Gemini thought signature
  * @param hasLeadingTextPart - Whether the message content serializes to a text part before the
  *   function-call parts
+ * @param signatures - Original per-part signatures. Used when they already match the parts.
  * @returns additional_kwargs object for AIMessage
  */
 function buildGeminiAdditionalKwargs(
 	toolCalls: Array<{ id: string; name: string; args: IDataObject }>,
 	thoughtSignature: string,
 	hasLeadingTextPart: boolean,
+	signatures?: string[],
 ): Record<string, unknown> {
-	const signatures = [
+	const resolvedSignatures = signatures ?? [
 		// Reserve the first position for the leading text part, which has no signature
 		...(hasLeadingTextPart ? [''] : []),
 		// Gemini attaches the thought signature only to the first function call
@@ -220,7 +240,7 @@ function buildGeminiAdditionalKwargs(
 			[toolCalls[0].id]: thoughtSignature,
 		},
 		tool_calls: toolCalls.map((tc) => ({ id: tc.id, name: tc.name, args: tc.args })),
-		signatures,
+		signatures: resolvedSignatures,
 	};
 }
 
@@ -244,7 +264,12 @@ function buildIndividualAIMessage(
 		type: 'tool_call' as const,
 	};
 
-	const content = buildMessageContent(providerMetadata, toolInput, toolId, toolName);
+	const anthropicContent = buildMessageContent(providerMetadata, toolInput, toolId, toolName);
+	// Anthropic puts the tool call inside the content array. Gemini keeps tool_calls,
+	// and the signature array has to line up with the content parts plus that call.
+	const geminiReplay =
+		anthropicContent === null ? geminiReplayForToolCount(providerMetadata, 1) : undefined;
+	const content = anthropicContent ?? geminiReplay?.content ?? null;
 
 	const additionalKwargs: Record<string, unknown> = providerMetadata.thoughtSignature
 		? buildGeminiAdditionalKwargs(
@@ -252,6 +277,7 @@ function buildIndividualAIMessage(
 				providerMetadata.thoughtSignature,
 				// Empty content produces no text part, so the function call is the first part
 				content !== null && content.length > 0,
+				geminiReplay?.signatures,
 			)
 		: {};
 	// DeepSeek's thinking mode requires reasoning_content to be echoed back on the
@@ -263,7 +289,7 @@ function buildIndividualAIMessage(
 	return new AIMessage({
 		content: content ?? [],
 		// When content is an array (Anthropic thinking), LangChain ignores tool_calls
-		...(content === null && { tool_calls: [toolCall] }),
+		...(anthropicContent === null && { tool_calls: [toolCall] }),
 		...(Object.keys(additionalKwargs).length > 0 && { additional_kwargs: additionalKwargs }),
 	});
 }
@@ -295,6 +321,20 @@ function buildSharedGeminiAIMessage(
 	}));
 
 	const toolNames = processedTools.map((pt) => pt.nodeName).join(', ');
+	const replay = sharedGeminiReplay(processedTools);
+
+	if (replay) {
+		return new AIMessage({
+			content: replay.content,
+			tool_calls: allToolCalls,
+			additional_kwargs: buildGeminiAdditionalKwargs(
+				allToolCalls,
+				thoughtSignature,
+				false,
+				replay.signatures,
+			),
+		});
+	}
 
 	return new AIMessage({
 		content: `Calling tools: ${toolNames}`,
@@ -302,6 +342,32 @@ function buildSharedGeminiAIMessage(
 		// String content serializes to a text part preceding the function-call parts
 		additional_kwargs: buildGeminiAdditionalKwargs(allToolCalls, thoughtSignature, true),
 	});
+}
+
+/**
+ * Returns the original Gemini parts when every tool call in the batch carries them.
+ * Parallel calls share one model turn, so the signature array is replayed once.
+ */
+function sharedGeminiReplay(
+	processedTools: ProcessedToolResponse[],
+): { content: GeminiReplayContent; signatures: string[] } | undefined {
+	const first = geminiReplayForToolCount(
+		processedTools[0]?.providerMetadata,
+		processedTools.length,
+	);
+	if (!first) return undefined;
+
+	const sameTurn = processedTools.every((tool) => {
+		const replay = geminiReplayForToolCount(tool.providerMetadata, processedTools.length);
+		return (
+			replay !== undefined &&
+			replay.signatures.length === first.signatures.length &&
+			replay.signatures.every((signature, index) => signature === first.signatures[index]) &&
+			JSON.stringify(replay.content) === JSON.stringify(first.content)
+		);
+	});
+
+	return sameTurn ? first : undefined;
 }
 
 /**
