@@ -785,6 +785,109 @@ describe('memoryManagement', () => {
 			expect(aiToolCallMessages).toHaveLength(1);
 		});
 
+		it('saves the model text from a Gemini tool turn and does not add synthetic text', async () => {
+			const sharedAIMessage = new AIMessage({
+				content: 'I will look that up.',
+				tool_calls: [
+					{ id: 'call-a', name: 'kb_lookup', args: { query: 'policy' }, type: 'tool_call' },
+					{ id: 'call-b', name: 'kb_lookup', args: { query: 'hours' }, type: 'tool_call' },
+				],
+				additional_kwargs: {
+					signatures: ['', 'sig-a', ''],
+					__gemini_function_call_thought_signatures__: { 'call-a': 'sig-a' },
+				},
+			});
+			const steps: ToolCallData[] = [
+				{
+					action: {
+						tool: 'kb_lookup',
+						toolInput: { query: 'policy' },
+						log: 'I will look that up.',
+						messageLog: [sharedAIMessage],
+						toolCallId: 'call-a',
+						type: 'tool_call',
+					},
+					observation: 'Policy text',
+				},
+				{
+					action: {
+						tool: 'kb_lookup',
+						toolInput: { query: 'hours' },
+						log: 'Calling kb_lookup',
+						messageLog: [],
+						toolCallId: 'call-b',
+						type: 'tool_call',
+					},
+					observation: 'Hours text',
+				},
+			];
+
+			await saveToMemory('What is the policy?', 'According to our policy', mockMemory, steps);
+
+			const savedMessages = mockChatHistory.addMessages.mock.calls[0][0];
+			expect(savedMessages[1]).toBe(sharedAIMessage);
+			expect(savedMessages[1].content).toBe('I will look that up.');
+			expect(savedMessages[1].tool_calls).toHaveLength(2);
+			expect(
+				savedMessages[1].additional_kwargs.__gemini_function_call_thought_signatures__,
+			).toEqual({
+				'call-a': 'sig-a',
+			});
+			expect(
+				JSON.stringify(savedMessages.map((message: { content: unknown }) => message.content)),
+			).not.toContain('Calling tools');
+		});
+
+		it('saves an empty Gemini tool-call message instead of a synthetic calling message', async () => {
+			const sharedAIMessage = new AIMessage({
+				content: [],
+				tool_calls: [
+					{ id: 'call-a', name: 'tool_a', args: { input: 'a' }, type: 'tool_call' },
+					{ id: 'call-b', name: 'tool_b', args: { input: 'b' }, type: 'tool_call' },
+				],
+				additional_kwargs: {
+					signatures: ['sig-a', ''],
+					__gemini_function_call_thought_signatures__: { 'call-a': 'sig-a' },
+				},
+			});
+			const steps: ToolCallData[] = [
+				{
+					action: {
+						tool: 'tool_a',
+						toolInput: { input: 'a' },
+						log: 'Calling tool_a',
+						messageLog: [sharedAIMessage],
+						toolCallId: 'call-a',
+						type: 'tool_call',
+					},
+					observation: 'A',
+				},
+				{
+					action: {
+						tool: 'tool_b',
+						toolInput: { input: 'b' },
+						log: 'Calling tool_b',
+						messageLog: [],
+						toolCallId: 'call-b',
+						type: 'tool_call',
+					},
+					observation: 'B',
+				},
+			];
+
+			await saveToMemory('Do both', 'Done', mockMemory, steps);
+
+			const savedMessages = mockChatHistory.addMessages.mock.calls[0][0];
+			expect(savedMessages[1].content).toEqual([]);
+			expect(savedMessages[1].additional_kwargs.signatures).toEqual(['sig-a', '']);
+			expect(
+				JSON.stringify(savedMessages.map((message: { content: unknown }) => message.content)),
+			).not.toContain('Calling tools');
+			expect(
+				JSON.stringify(savedMessages.map((message: { content: unknown }) => message.content)),
+			).not.toContain('with input');
+		});
+
 		it('should fall back to string format when addMessages is not available', async () => {
 			// Create a chat history object without addMessages method
 			mockMemory.chatHistory = {} as any;

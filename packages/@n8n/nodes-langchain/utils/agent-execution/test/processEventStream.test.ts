@@ -110,6 +110,34 @@ describe('processEventStream', () => {
 			expect(result.toolCalls?.[0].tool).toBe('create_repair_order');
 		});
 
+		it('keeps the model message on every tool call in a parallel turn', async () => {
+			const result = await processEventStream(
+				ctx,
+				toStream([
+					streamChunk('I am going to convert both words.'),
+					modelEnd({
+						content: 'I am going to convert both words.',
+						tool_calls: [
+							{ name: 'code_tool', args: { input: 'alpha' }, id: 'call-1', type: 'tool_call' },
+							{ name: 'reverse_tool', args: { input: 'beta' }, id: 'call-2', type: 'tool_call' },
+						],
+					}),
+				]),
+				0,
+			);
+
+			expect(result.toolCalls).toHaveLength(2);
+			expect(result.toolCalls?.[0].log).toBe('I am going to convert both words.');
+			expect(result.toolCalls?.[1].log).toBe('I am going to convert both words.');
+			expect(result.toolCalls?.[0].messageLog?.[0]).toMatchObject({
+				content: 'I am going to convert both words.',
+			});
+			expect(result.toolCalls?.[1].messageLog?.[0]).toMatchObject({
+				content: 'I am going to convert both words.',
+			});
+			expect(JSON.stringify(result.toolCalls)).not.toContain('Calling tools');
+		});
+
 		it('records log as text, not the raw content-block array', async () => {
 			const result = await processEventStream(
 				ctx,

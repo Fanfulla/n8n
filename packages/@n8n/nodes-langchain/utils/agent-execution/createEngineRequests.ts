@@ -1,4 +1,5 @@
 import type { DynamicStructuredTool, Tool } from '@langchain/classic/tools';
+import { isRecord } from '@n8n/utils/is-record';
 import isObject from 'lodash/isObject';
 import omit from 'lodash/omit';
 import type { EngineRequest, IDataObject } from 'n8n-workflow';
@@ -34,6 +35,40 @@ export function extractHitlMetadata(
 		toolName,
 		originalInput: toolInput.toolParameters as IDataObject,
 	};
+}
+
+/**
+ * Reads the visible text from one model message.
+ * A string is the text. An array contributes only `text` blocks.
+ * Reasoning and tool blocks are not visible text.
+ */
+function visibleTextFromContent(content: unknown): string | undefined {
+	if (typeof content === 'string') {
+		return content.length > 0 ? content : undefined;
+	}
+	if (!Array.isArray(content)) return undefined;
+
+	let text = '';
+	for (const block of content) {
+		if (!isRecord(block) || block.type !== 'text' || typeof block.text !== 'string') continue;
+		text += block.text;
+	}
+	return text.length > 0 ? text : undefined;
+}
+
+/**
+ * Returns the first visible text in the message log.
+ * The agent replays this text with the Gemini tool call.
+ */
+function extractModelText(messageLog: unknown[] | undefined): string | undefined {
+	if (!Array.isArray(messageLog)) return undefined;
+
+	for (const message of messageLog) {
+		if (!isRecord(message) || !('content' in message)) continue;
+		const text = visibleTextFromContent(message.content);
+		if (text) return text;
+	}
+	return undefined;
 }
 
 /**
@@ -179,7 +214,8 @@ function extractThinkingMetadata(
 
 	// Build result object
 	if (thoughtSignature) {
-		result.google = { thoughtSignature };
+		const modelText = extractModelText(effectiveMessageLog);
+		result.google = modelText ? { thoughtSignature, modelText } : { thoughtSignature };
 	}
 
 	// Empty thinking text is valid because the signature carries the reasoning.

@@ -1105,4 +1105,137 @@ describe('createEngineRequests', () => {
 			expect(result[0].metadata.google?.thoughtSignature).toBe('actual_signature');
 		});
 	});
+
+	describe('Gemini model text', () => {
+		it('stores string content from the model message with the thought signature', () => {
+			const tools = [createMockTool('calculator', { sourceNodeName: 'Calculator' })];
+			const toolCalls: ToolCallRequest[] = [
+				{
+					tool: 'calculator',
+					toolInput: { expression: '2+2' },
+					toolCallId: 'call_123',
+					messageLog: [
+						{
+							content: 'I will calculate that.',
+							additional_kwargs: {
+								__gemini_function_call_thought_signatures__: {
+									call_123: 'sig_from_message',
+								},
+							},
+						},
+					],
+				},
+			];
+
+			const result = createEngineRequests(toolCalls, 0, tools);
+
+			expect(result[0].metadata.google).toEqual({
+				thoughtSignature: 'sig_from_message',
+				modelText: 'I will calculate that.',
+			});
+		});
+
+		it('joins text blocks and skips reasoning blocks', () => {
+			const tools = [createMockTool('code_tool', { sourceNodeName: 'code_tool' })];
+			const toolCalls: ToolCallRequest[] = [
+				{
+					tool: 'code_tool',
+					toolInput: { input: 'alpha' },
+					toolCallId: 'call_1',
+					additionalKwargs: {
+						signatures: ['', '', 'sig_on_call'],
+					},
+					messageLog: [
+						{
+							content: [
+								{ type: 'text', text: 'I am' },
+								{ type: 'reasoning', reasoning: 'hidden thought' },
+								{ type: 'text', text: ' going to convert both words.' },
+							],
+						},
+					],
+				},
+			];
+
+			const result = createEngineRequests(toolCalls, 0, tools);
+
+			expect(result[0].metadata.google?.thoughtSignature).toBe('sig_on_call');
+			expect(result[0].metadata.google?.modelText).toBe('I am going to convert both words.');
+			expect(result[0].metadata.google?.modelText).not.toContain('hidden thought');
+			expect(result[0].metadata.google?.modelText).not.toContain('Calling tools');
+		});
+
+		it('shares model text from the first message log across parallel tool calls', () => {
+			const tools = [
+				createMockTool('code_tool', { sourceNodeName: 'code_tool' }),
+				createMockTool('reverse_tool', { sourceNodeName: 'reverse_tool' }),
+			];
+			const toolCalls: ToolCallRequest[] = [
+				{
+					tool: 'code_tool',
+					toolInput: { input: 'alpha' },
+					toolCallId: 'call_1',
+					messageLog: [
+						{
+							content: 'I am going to convert both words.',
+							additional_kwargs: {
+								signatures: ['', 'shared_signature', ''],
+							},
+						},
+					],
+				},
+				{
+					tool: 'reverse_tool',
+					toolInput: { input: 'beta' },
+					toolCallId: 'call_2',
+					messageLog: [],
+				},
+			];
+
+			const result = createEngineRequests(toolCalls, 0, tools);
+
+			expect(result).toHaveLength(2);
+			expect(result[0].metadata.google?.modelText).toBe('I am going to convert both words.');
+			expect(result[1].metadata.google?.modelText).toBe('I am going to convert both words.');
+			expect(result[0].metadata.google?.thoughtSignature).toBe('shared_signature');
+			expect(result[1].metadata.google?.thoughtSignature).toBe('shared_signature');
+		});
+
+		it('omits model text when the model message has no visible text', () => {
+			const tools = [createMockTool('calculator', { sourceNodeName: 'Calculator' })];
+			const toolCalls: ToolCallRequest[] = [
+				{
+					tool: 'calculator',
+					toolInput: { expression: '2+2' },
+					toolCallId: 'call_123',
+					messageLog: [{ content: '' }],
+					additionalKwargs: {
+						__gemini_function_call_thought_signatures__: {
+							call_123: 'sig_only',
+						},
+					},
+				},
+			];
+
+			const result = createEngineRequests(toolCalls, 0, tools);
+
+			expect(result[0].metadata.google).toEqual({ thoughtSignature: 'sig_only' });
+		});
+
+		it('does not set Google metadata for text that has no thought signature', () => {
+			const tools = [createMockTool('calculator', { sourceNodeName: 'Calculator' })];
+			const toolCalls: ToolCallRequest[] = [
+				{
+					tool: 'calculator',
+					toolInput: { expression: '2+2' },
+					toolCallId: 'call_123',
+					messageLog: [{ content: 'I will calculate that.' }],
+				},
+			];
+
+			const result = createEngineRequests(toolCalls, 0, tools);
+
+			expect(result[0].metadata.google).toBeUndefined();
+		});
+	});
 });
